@@ -1,0 +1,390 @@
+diff -Naur linux-2.6.9/arch/i386/kernel/entry.S linux-2.6.9lab4/arch/i386/kernel/entry.S
+--- linux-2.6.9/arch/i386/kernel/entry.S	2004-10-18 17:53:44.000000000 -0400
++++ linux-2.6.9lab4/arch/i386/kernel/entry.S	2013-03-14 13:18:36.000000000 -0400
+@@ -901,5 +901,7 @@
+ 	.long sys_mq_getsetattr
+ 	.long sys_ni_syscall		/* reserved for kexec */
+ 	.long sys_waitid
++	.long sys_cp_range              /* 285 */
++	.long sys_inc_cp_range          /* 286 */
+ 
+ syscall_table_size=(.-sys_call_table)
+diff -Naur linux-2.6.9/include/asm-i386/unistd.h linux-2.6.9lab4/include/asm-i386/unistd.h
+--- linux-2.6.9/include/asm-i386/unistd.h	2004-10-18 17:54:37.000000000 -0400
++++ linux-2.6.9lab4/include/asm-i386/unistd.h	2013-03-14 13:20:30.000000000 -0400
+@@ -290,8 +290,10 @@
+ #define __NR_mq_getsetattr	(__NR_mq_open+5)
+ #define __NR_sys_kexec_load	283
+ #define __NR_waitid		284
++#define __NR_cp_range           285
++#define __NR_inc_cp_range       286
+ 
+-#define NR_syscalls 285
++#define NR_syscalls 287
+ 
+ /* user-visible error numbers are in the range -1 - -124: see <asm-i386/errno.h> */
+ 
+diff -Naur linux-2.6.9/include/linux/sched.h linux-2.6.9lab4/include/linux/sched.h
+--- linux-2.6.9/include/linux/sched.h	2004-10-18 17:53:13.000000000 -0400
++++ linux-2.6.9lab4/include/linux/sched.h	2013-03-14 10:20:30.000000000 -0400
+@@ -435,6 +435,8 @@
+ struct mempolicy;
+ 
+ struct task_struct {
++	int checkpoints;
++
+ 	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
+ 	struct thread_info *thread_info;
+ 	atomic_t usage;
+diff -Naur linux-2.6.9/kernel/checkpoint.c linux-2.6.9lab4/kernel/checkpoint.c
+--- linux-2.6.9/kernel/checkpoint.c	1969-12-31 19:00:00.000000000 -0500
++++ linux-2.6.9lab4/kernel/checkpoint.c	2013-03-21 09:45:12.000000000 -0400
+@@ -0,0 +1,324 @@
++#include "../include/linux/sched.h"
++#include "../include/linux/mm.h"
++#include "../include/asm-i386/io.h"
++#include "../include/linux/rmap.h"
++#include "../include/linux/list.h"
++#include "../include/linux/fcntl.h"
++#include "../include/linux/kernel.h"
++#include "../include/linux/string.h"
++#include "../include/asm/uaccess.h"
++#include "../include/linux/syscalls.h"
++#include "../include/asm/pgtable.h"
++
++//
++// Function to check the status of a page
++//
++int
++valid_page(struct page *pg, unsigned long pgstart) {
++  if(!pg) {
++      printk(KERN_INFO "Page does not exist..\n");
++      return 0;
++  }
++
++  if (PageLocked(pg)) {
++      printk(KERN_INFO "Page locked: %lu\n", pgstart);
++      return 0;
++  }
++
++  if (PageError(pg)) {
++      printk(KERN_INFO "Page error: %lu\n", pgstart);
++      return 0;
++  }
++
++  if (PageReclaim(pg))
++      printk(KERN_INFO "Page is reclaim: %lu\n", pgstart);
++  if (PageMappedToDisk(pg))
++      printk(KERN_INFO "Page is mappedtodisk: %lu\n", pgstart);
++  if (PageSwapCache(pg))
++      printk(KERN_INFO "Page is swapcache: %lu\n", pgstart);
++  if (PageCompound(pg))
++      printk(KERN_INFO "Page is compound: %lu\n", pgstart);
++  if (PageNosave(pg))
++      printk(KERN_INFO "Page is nosave: %lu\n", pgstart);
++  if (PageWriteback(pg))
++      printk(KERN_INFO "Page is writeback: %lu\n", pgstart);
++  if (PagePrivate(pg))
++      printk(KERN_INFO "Page is private: %lu\n", pgstart);
++  if (PageChecked(pg))
++      printk(KERN_INFO "Page is checked: %lu\n", pgstart);
++  if (PageSlab(pg))
++      printk(KERN_INFO "Page is slab: %lu\n", pgstart);
++  if (PageActive(pg))
++      printk(KERN_INFO "Page is active: %lu\n", pgstart);
++  if (PageLRU(pg))
++      printk(KERN_INFO "Page is lru: %lu\n", pgstart);
++  if (PageUptodate(pg))
++      printk(KERN_INFO "Page is uptodate: %lu\n", pgstart);
++  if (PageReferenced(pg))
++      printk(KERN_INFO "Page is referenced: %lu\n", pgstart);
++  if (PageHighMem(pg))
++      printk(KERN_INFO "Page is highmem: %lu\n", pgstart);
++
++  if (PageReserved(pg)) {
++      printk(KERN_INFO "Page reserved: %lu\n", pgstart);
++      return 0;
++  }
++
++  if (pg == ZERO_PAGE(pgstart)) {
++      printk(KERN_INFO "Incremental: ZERO page: %lu\n", pgstart);
++      return 0;
++  }
++
++  return 1;
++}
++
++//
++// Function to limit the end address to user code
++//
++void *
++limit_start(void *start) {
++  unsigned long min = 0x08048000;
++  if ((unsigned long) start < min) {
++    return (void *) min;
++  }
++  return start;
++}
++
++//
++// Function to limit the end address to user code
++//
++void *
++limit_end(void *end) {
++  unsigned long kernel_code = 0xc0000000;
++  if ((unsigned long) end >= kernel_code) {
++    return (void *) kernel_code - 1;
++  }
++  return end;
++}
++
++//
++// Function to dump a page to /tmp/<pid>-cp<n>
++// where:
++//  - pid = current->pid
++//  - n   = current->checkpoints
++//
++void
++page_dump(unsigned long addr) {
++  unsigned long i;
++  int fd;
++  mm_segment_t old_fs;
++
++  // Generate filename to output to
++  char *filename = kmalloc(32, GFP_KERNEL);
++  sprintf(filename, "/tmp/%d-cp%d", current->pid, current->checkpoints);
++
++  // Allow us to use sys_{open,write,close}
++  old_fs = get_fs();
++  set_fs(KERNEL_DS);
++  fd = sys_open(filename, O_RDWR|O_APPEND|O_CREAT, 0777);
++
++  if (fd) {
++    // Write page header
++    printk(KERN_INFO "Starting new page\n");
++    char *s = kmalloc(128, GFP_KERNEL);
++    sprintf(s, "-- Page at 0x%lX --\n", addr);
++    sys_write(fd, s, strlen(s));
++    kfree(s);
++
++    // Loop through all addresses in page
++    for (i = addr; i < addr + PAGE_SIZE; i++) {
++      long int *val = (unsigned long *) i;
++      char *a = kmalloc(32, GFP_KERNEL);
++
++      // Dump address
++      sprintf(a, "0x%lX ", *val);
++      sys_write(fd, a, strlen(a));
++      kfree(a);
++
++      // Write newline and address at beginning of line
++      if (i % 8 == 7) {
++        char *newline = kmalloc(32, GFP_KERNEL);
++        sprintf(newline, "\n0x%lX: ", i+1);
++        sys_write(fd, newline, strlen(newline));
++        kfree(newline);
++      }
++    }
++  }
++
++  // Cleanup
++  sys_close(fd);
++  set_fs(old_fs);
++  kfree(filename);
++}
++
++int sys_cp_range(void *start, void *end)
++{
++  struct mm_struct *mm = current->active_mm;
++  struct vm_area_struct *vma_start, *vma_end, *vma;
++  unsigned long e, s;
++
++  // Get start and end
++  void *_start = limit_start(start);
++  s = (unsigned long) _start;
++
++  void *_end = limit_end(end);
++  e = (unsigned long) _end;
++
++  printk(KERN_INFO "Passed in <start,end> = <%lu, %lu>....\n", s, e);
++  vma_start = find_vma(mm, s);
++  vma_end = find_vma(mm, e);
++  vma = vma_start;
++
++  // Increase num checkpoints done
++  current->checkpoints++;
++
++  // Walk vma list
++  while (vma) {
++    unsigned long pgstart;
++
++    printk(KERN_INFO "Going through new VMA <%lu, %lu>....\n",
++           vma->vm_start,
++           vma->vm_end);
++
++    // Check for locked VM
++    if (vma->vm_flags & VM_LOCKED) {
++      vma = vma->vm_next;
++      printk(KERN_INFO "Incremental: Skipping because VMA is locked...\n");
++      continue;
++    }
++
++    // Check for IO mappings
++    if (vma->vm_flags & VM_IO) {
++      vma = vma->vm_next;
++      printk(KERN_INFO "Incremental: Skipping because VMA is I/O mapped...\n");
++      continue;
++    }
++
++    // Check for permissions
++    if (!(vma->vm_flags & VM_READ)) {
++      vma = vma->vm_next;
++      printk(KERN_INFO "Incremental: Skipping because VMA has no read permissions...\n");
++      continue;
++    }
++
++    // Loop through each page
++    for (pgstart = vma->vm_start; pgstart < vma->vm_end; pgstart += PAGE_SIZE) {
++      // Check bounds
++      struct page *pg = follow_page(mm, pgstart, 0);
++
++      if (!valid_page(pg, pgstart))
++        continue;
++
++      if ((pgstart <= s && pgstart+PAGE_SIZE >= e)
++          || (pgstart <= s && pgstart+PAGE_SIZE <= e)
++          || (pgstart >= s && pgstart+PAGE_SIZE <= e)) {
++        page_dump(pgstart);
++      } else {
++        printk(KERN_INFO "Page out of bounds\n");
++      }
++    }
++
++    // Check end condition
++    if (vma->vm_start == vma_end->vm_start)
++      break;
++    vma = vma->vm_next;
++  }
++
++  return 0;
++}
++
++int sys_inc_cp_range(void *start, void *end)
++{
++  struct mm_struct *mm = current->active_mm;
++  struct vm_area_struct *vma_start, *vma_end, *vma;
++  struct page* pg;
++  pgd_t *pgd;
++  pmd_t *pmd;
++  pte_t *ptep, pte;
++  unsigned long s, e;
++
++  // Get start and end
++  start = limit_start(start);
++  s = (unsigned long) start;
++
++  end = limit_end(end);
++  e = (unsigned long) end;
++
++  printk(KERN_INFO "Passed in <start,end> = <%lu, %lu>....\n", s, e);
++  vma_start = find_vma(mm, s);
++  vma_end = find_vma(mm, e);
++  vma = vma_start;
++
++  if(current->checkpoints == 0){
++     printk(KERN_INFO "Incremental: calling sys_cp_range\n");
++     sys_cp_range(start, end);
++     return 0;
++  }
++
++  // Increase num checkpoints done
++  current->checkpoints++;
++
++  // Walk vma list
++  while (vma) {
++    unsigned long pgstart;
++
++    printk(KERN_INFO "Incremental: Going through new VMA <%lu, %lu>....\n",
++           vma->vm_start,
++           vma->vm_end);
++
++    // Check for locked VM
++    if (vma->vm_flags & VM_LOCKED) {
++      vma = vma->vm_next;
++      printk(KERN_INFO "Incremental: Skipping because VMA is locked...\n");
++      continue;
++    }
++
++    // Check for IO mappings
++    if (vma->vm_flags & VM_IO) {
++      vma = vma->vm_next;
++      printk(KERN_INFO "Incremental: Skipping because VMA is I/O mapped...");
++      continue;
++    }
++
++    // Check for permissions
++    if (!(vma->vm_flags & VM_READ)) {
++      vma = vma->vm_next;
++      printk(KERN_INFO "Incremental: Skipping because VMA has no read permissions...");
++      continue;
++    }
++    
++    // Loop through each page
++    for (pgstart = vma->vm_start; pgstart < vma->vm_end; pgstart += PAGE_SIZE) {
++      pg = follow_page(mm, pgstart, 0);
++
++      if (!valid_page(pg, pgstart))
++        continue;
++
++      // Check bounds
++      pgd = pgd_offset(mm, pgstart);
++      pmd = pmd_offset(pgd, pgstart);
++      ptep = pte_offset_map(pmd, pgstart);
++      pte = *ptep;
++
++      if(PageDirty(pg))
++        printk(KERN_INFO "Page is dirty\n");
++    
++      if(pte_dirty(pte))
++	printk(KERN_INFO "pte: Page is dirty\n");
++
++      if (((pgstart <= s && pgstart+PAGE_SIZE >= e)
++          || (pgstart <= s && pgstart+PAGE_SIZE <= e)
++          || (pgstart >= s && pgstart+PAGE_SIZE <= e))
++          && pte_dirty(pte)) {
++                   page_dump(pgstart);
++      }
++    }
++
++    // Check end condition
++    if (vma->vm_start == vma_end->vm_start)
++      break;
++    vma = vma->vm_next;
++  }
++
++  return 0;
++}
+diff -Naur linux-2.6.9/kernel/Makefile linux-2.6.9lab4/kernel/Makefile
+--- linux-2.6.9/kernel/Makefile	2004-10-18 17:53:43.000000000 -0400
++++ linux-2.6.9lab4/kernel/Makefile	2013-03-06 11:53:48.000000000 -0500
+@@ -7,7 +7,7 @@
+ 	    sysctl.o capability.o ptrace.o timer.o user.o \
+ 	    signal.o sys.o kmod.o workqueue.o pid.o \
+ 	    rcupdate.o intermodule.o extable.o params.o posix-timers.o \
+-	    kthread.o
++	    kthread.o checkpoint.o
+ 
+ obj-$(CONFIG_FUTEX) += futex.o
+ obj-$(CONFIG_GENERIC_ISA_DMA) += dma.o
+diff -Naur linux-2.6.9/Makefile linux-2.6.9lab4/Makefile
+--- linux-2.6.9/Makefile	2004-10-18 17:54:38.000000000 -0400
++++ linux-2.6.9lab4/Makefile	2013-03-06 11:47:47.000000000 -0500
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 9
+-EXTRAVERSION =
++EXTRAVERSION = lab4
+ NAME=Zonked Quokka
+ 
+ # *DOCUMENTATION*

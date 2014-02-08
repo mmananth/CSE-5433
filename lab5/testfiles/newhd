@@ -1,0 +1,36 @@
+#!/usr/bin/env python
+import os
+import commands
+import sys
+
+def d(tuple):
+    out = tuple[1]
+    if out:
+         print out
+
+def die(msg):
+    """Quit and provide error message"""
+    print msg
+    sys.exit(1)
+
+def main(args):
+    """Call dd and mklab5fs on an existing file"""
+    fn = args[0]
+    sz = 0
+    try:
+        sz = int(args[1])
+    except ValueError:
+        die("Could not convert 2nd argument to int type")
+    if not os.path.exists(fn):
+        d(commands.getstatusoutput("touch %s" % fn))
+    of = "of=%s" % fn
+    sz = sz*1024
+    d(commands.getstatusoutput("dd if=/dev/zero %s bs=%s count=1024" % (of, sz)))
+    d(commands.getstatusoutput("./mklab5fs %s" % fn))
+    return 0
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+      die("Please provide two arguments:\n./newhd <dev> <size_in_mb>")
+    args = sys.argv[1:]
+    sys.exit(main(args))

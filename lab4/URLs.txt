@@ -1,0 +1,4 @@
+http://lwn.net/images/pdf/LDD3/ch15.pdf
+http://linux-mm.org/HighMemory	
+http://lwn.net/Articles/75174/
+http://unix.stackexchange.com/questions/4929/what-are-high-memory-and-low-memory-on-linux

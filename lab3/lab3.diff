@@ -1,0 +1,256 @@
+diff -Naur linux-2.6.9lab3/arch/i386/kernel/entry.S linux-2.6.9/arch/i386/kernel/entry.S
+--- linux-2.6.9lab3/arch/i386/kernel/entry.S	2013-02-18 12:16:07.000000000 -0500
++++ linux-2.6.9/arch/i386/kernel/entry.S	2004-10-18 17:53:44.000000000 -0400
+@@ -901,7 +901,5 @@
+ 	.long sys_mq_getsetattr
+ 	.long sys_ni_syscall		/* reserved for kexec */
+ 	.long sys_waitid
+-	.long sys_toggle_fssp           /* 285 */
+-	.long sys_profile_fssp           /* 286 */
+ 
+ syscall_table_size=(.-sys_call_table)
+diff -Naur linux-2.6.9lab3/include/asm-i386/unistd.h linux-2.6.9/include/asm-i386/unistd.h
+--- linux-2.6.9lab3/include/asm-i386/unistd.h	2013-02-18 12:17:17.000000000 -0500
++++ linux-2.6.9/include/asm-i386/unistd.h	2004-10-18 17:54:37.000000000 -0400
+@@ -290,10 +290,8 @@
+ #define __NR_mq_getsetattr	(__NR_mq_open+5)
+ #define __NR_sys_kexec_load	283
+ #define __NR_waitid		284
+-#define __NR_toggle_fssp        285
+-#define __NR_profile_fssp       286
+ 
+-#define NR_syscalls 287
++#define NR_syscalls 285
+ 
+ /* user-visible error numbers are in the range -1 - -124: see <asm-i386/errno.h> */
+ 
+diff -Naur linux-2.6.9lab3/include/linux/sched.h linux-2.6.9/include/linux/sched.h
+--- linux-2.6.9lab3/include/linux/sched.h	2013-02-22 10:12:34.000000000 -0500
++++ linux-2.6.9/include/linux/sched.h	2004-10-18 17:53:13.000000000 -0400
+@@ -126,7 +126,6 @@
+ #define SCHED_NORMAL		0
+ #define SCHED_FIFO		1
+ #define SCHED_RR		2
+-#define SCHED_FSSP              3
+ 
+ struct sched_param {
+ 	int sched_priority;
+@@ -330,7 +329,6 @@
+ 
+ #define MAX_USER_RT_PRIO	100
+ #define MAX_RT_PRIO		MAX_USER_RT_PRIO
+-#define MIN_RT_PRIO		0
+ 
+ #define MAX_PRIO		(MAX_RT_PRIO + 40)
+ 
+@@ -342,7 +340,6 @@
+ struct user_struct {
+ 	atomic_t __count;	/* reference count */
+ 	atomic_t processes;	/* How many processes does this user have? */
+-	atomic_t fssp_processes;/* How many FSSP processes does this user have? */
+ 	atomic_t files;		/* How many open files does this user have? */
+ 	atomic_t sigpending;	/* How many pending signals does this user have? */
+ 	/* protected by mq_lock	*/
+@@ -438,7 +435,6 @@
+ struct mempolicy;
+ 
+ struct task_struct {
+-	int is_fssp;		/* Determines if a process is fssp managed */
+ 	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
+ 	struct thread_info *thread_info;
+ 	atomic_t usage;
+diff -Naur linux-2.6.9lab3/kernel/sched.c linux-2.6.9/kernel/sched.c
+--- linux-2.6.9lab3/kernel/sched.c	2013-02-25 09:44:17.000000000 -0500
++++ linux-2.6.9/kernel/sched.c	2004-10-18 17:54:55.000000000 -0400
+@@ -47,11 +47,6 @@
+ 
+ #include <asm/unistd.h>
+ 
+-/* FSSP */
+-int fssp_profile;
+-int fssp_num_users,
+-    fssp_ts_per_user;
+-
+ #ifdef CONFIG_NUMA
+ #define cpu_to_node_mask(cpu) node_to_cpumask(cpu_to_node(cpu))
+ #else
+@@ -180,18 +175,6 @@
+ 
+ static unsigned int task_timeslice(task_t *p)
+ {
+-	if (p->is_fssp) {
+-		unsigned int ts = fssp_ts_per_user / atomic_read(&current->user->fssp_processes);
+-		ts = ts > MIN_TIMESLICE ? ts : MIN_TIMESLICE;
+-
+-		/* FSSP profiling */
+-		if (fssp_profile) {
+-			printk(KERN_INFO "FSSP: TS:%u, UID:%u, PID:%d\n", ts, p->user->uid, p->pid);
+-		}
+-
+-		return ts;
+-	}
+-
+ 	if (p->static_prio < NICE_TO_PRIO(0))
+ 		return SCALE_PRIO(DEF_TIMESLICE*4, p->static_prio);
+ 	else
+@@ -1445,7 +1428,7 @@
+  * was given away by the parent in the first place.)
+  */
+ void fastcall sched_exit(task_t * p)
+-{	
++{
+ 	unsigned long flags;
+ 	runqueue_t *rq;
+ 
+@@ -3236,7 +3219,7 @@
+ 	else {
+ 		retval = -EINVAL;
+ 		if (policy != SCHED_FIFO && policy != SCHED_RR &&
+-				policy != SCHED_NORMAL && policy != SCHED_FSSP)
++				policy != SCHED_NORMAL)
+ 			goto out_unlock;
+ 	}
+ 	profile_hit(SCHED_PROFILING, __builtin_return_address(0));
+@@ -3301,7 +3284,7 @@
+ asmlinkage long sys_sched_setscheduler(pid_t pid, int policy,
+ 				       struct sched_param __user *param)
+ {
+-	//return setscheduler(pid, policy, param);
++	return setscheduler(pid, policy, param);
+ }
+ 
+ /**
+@@ -3311,7 +3294,7 @@
+  */
+ asmlinkage long sys_sched_setparam(pid_t pid, struct sched_param __user *param)
+ {
+-	//return setscheduler(pid, -1, param);
++	return setscheduler(pid, -1, param);
+ }
+ 
+ /**
+@@ -3624,7 +3607,6 @@
+ 	case SCHED_RR:
+ 		ret = MAX_USER_RT_PRIO-1;
+ 		break;
+-	case SCHED_FSSP:
+ 	case SCHED_NORMAL:
+ 		ret = 0;
+ 		break;
+@@ -3648,7 +3630,6 @@
+ 	case SCHED_RR:
+ 		ret = 1;
+ 		break;
+-	case SCHED_FSSP:
+ 	case SCHED_NORMAL:
+ 		ret = 0;
+ 	}
+@@ -4702,11 +4683,6 @@
+ 	runqueue_t *rq;
+ 	int i, j, k;
+ 
+-	/* Initialize FSSP */
+-	fssp_profile = 0;
+-	fssp_num_users = 0;
+-        fssp_ts_per_user = 0;
+-
+ #ifdef CONFIG_SMP
+ 	/* Set up an initial dummy domain for early boot */
+ 	static struct sched_domain sched_domain_init;
+@@ -4790,73 +4766,4 @@
+ #endif
+ }
+ EXPORT_SYMBOL(__might_sleep);
+-
+ #endif
+-
+-/***** FSSP *****/
+-void fssp_calc_ts_per_user(void) {
+-  if (fssp_num_users == 0) {
+-    /* Just in case, don't let this divide by zero! */
+-    fssp_ts_per_user = DEF_TIMESLICE;
+-  } else {
+-    /* Calculate TS per user, bounding above and below by MIN/DEF TS */
+-    fssp_ts_per_user = DEF_TIMESLICE / fssp_num_users > MIN_TIMESLICE ?
+-                       DEF_TIMESLICE / fssp_num_users :
+-                       MIN_TIMESLICE;
+-  }
+-}
+-
+-asmlinkage long
+-sys_toggle_fssp(long pid, int status) {
+-  task_t *t = find_task_by_pid(pid);
+-  struct sched_param s;
+-  s.sched_priority = MIN_RT_PRIO;
+-
+-  if (status) {
+-    if (fssp_profile)
+-      printk(KERN_INFO "New FSSP process found %d!\n", t->pid);
+-
+-    /* If no processes for user yet, increase user count */
+-    if (atomic_read(&t->user->fssp_processes) == 0) {
+-      fssp_num_users++;
+-      if (fssp_profile)
+-        printk(KERN_INFO "New user %d!\n", t->user->uid);
+-    }
+-
+-    /* Increase process count for user and set TS to fssp */
+-    atomic_inc(&t->user->fssp_processes);
+-    t->is_fssp = 1;
+-
+-    /* Recalculate timeslice per user and set the sceduler */
+-    fssp_calc_ts_per_user();
+-    setscheduler(pid, SCHED_FSSP, &s);
+-  } else {
+-    if (fssp_profile)
+-      printk(KERN_INFO "FSSP process %d quitting!\n", t->pid);
+-
+-    /* Decrease process count for user and set TS to NOT FSSP */
+-    atomic_dec(&t->user->fssp_processes);
+-    t->is_fssp = 0;
+-
+-    /* If no processes for user anymore, decrease user count */
+-    if (atomic_read(&t->user->fssp_processes) == 0) {
+-      fssp_num_users--;
+-      if (fssp_profile)
+-        printk(KERN_INFO "User %d done!\n", t->user->uid);
+-    }
+-
+-    /* Recalculate timeslice per user and set the sceduler */
+-    fssp_calc_ts_per_user();
+-    setscheduler(pid, SCHED_NORMAL, &s);
+-  }
+-
+-  return 1;
+-}
+-
+-asmlinkage long
+-sys_profile_fssp(int status) {
+-  if (status != 0 && status != 1)
+-    return -1;
+-  fssp_profile = status;
+-  return 1;
+-}
+diff -Naur linux-2.6.9lab3/kernel/user.c linux-2.6.9/kernel/user.c
+--- linux-2.6.9lab3/kernel/user.c	2013-02-22 09:44:43.000000000 -0500
++++ linux-2.6.9/kernel/user.c	2004-10-18 17:53:50.000000000 -0400
+@@ -110,7 +110,6 @@
+ 		new->uid = uid;
+ 		atomic_set(&new->__count, 1);
+ 		atomic_set(&new->processes, 0);
+-		atomic_set(&new->fssp_processes, 0);
+ 		atomic_set(&new->files, 0);
+ 		atomic_set(&new->sigpending, 0);
+ 
+diff -Naur linux-2.6.9lab3/Makefile linux-2.6.9/Makefile
+--- linux-2.6.9lab3/Makefile	2013-02-15 10:11:13.000000000 -0500
++++ linux-2.6.9/Makefile	2004-10-18 17:54:38.000000000 -0400
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 9
+-EXTRAVERSION = lab3
++EXTRAVERSION =
+ NAME=Zonked Quokka
+ 
+ # *DOCUMENTATION*

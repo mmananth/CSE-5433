@@ -1,0 +1,224 @@
+diff -Naur linux-2.6.9/arch/i386/kernel/entry.S linux-2.6.9lab2/arch/i386/kernel/entry.S
+--- linux-2.6.9/arch/i386/kernel/entry.S	2004-10-18 17:53:44.000000000 -0400
++++ linux-2.6.9lab2/arch/i386/kernel/entry.S	2013-01-30 11:36:19.000000000 -0500
+@@ -901,5 +901,6 @@
+ 	.long sys_mq_getsetattr
+ 	.long sys_ni_syscall		/* reserved for kexec */
+ 	.long sys_waitid
++	.long sys_mycounter             /* 285 */
+ 
+ syscall_table_size=(.-sys_call_table)
+diff -Naur linux-2.6.9/fs/proc/Makefile linux-2.6.9lab2/fs/proc/Makefile
+--- linux-2.6.9/fs/proc/Makefile	2004-10-18 17:53:11.000000000 -0400
++++ linux-2.6.9lab2/fs/proc/Makefile	2013-02-01 12:21:47.000000000 -0500
+@@ -6,6 +6,7 @@
+ 
+ proc-y			:= task_nommu.o
+ proc-$(CONFIG_MMU)	:= task_mmu.o
++obj-m			:= mycounter.o
+ 
+ proc-y       += inode.o root.o base.o generic.o array.o \
+ 		kmsg.o proc_tty.o proc_misc.o
+diff -Naur linux-2.6.9/fs/proc/mycounter.c linux-2.6.9lab2/fs/proc/mycounter.c
+--- linux-2.6.9/fs/proc/mycounter.c	1969-12-31 19:00:00.000000000 -0500
++++ linux-2.6.9lab2/fs/proc/mycounter.c	2013-02-05 17:15:16.000000000 -0500
+@@ -0,0 +1,84 @@
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/proc_fs.h>
++
++/* Global definitions to file entries and names */
++#define kernel_name "kernel"
++#define procfs_name "sys/kernel/mycounter"
++struct proc_dir_entry *Our_Proc_File, *kernel_dir;
++
++/* Global state value - holds the value 0 or 1 (or whatever
++ * the user enters while writing */
++char value;
++
++int
++procfile_read(char *buffer,
++	      char **buffer_location,
++	      off_t offset, int buffer_length, int *eof, void *data)
++{
++	int ret;
++	
++	printk(KERN_INFO "procfile_read (/proc/%s) called\n", procfs_name);
++
++	if (offset > 0) {
++		/* we have finished to read, return 0 */
++		ret  = 0;
++	} else {
++		/* fill the buffer, return the buffer size */
++		ret = sprintf(buffer, "%c\n", value + '0');
++	}
++
++	return ret;
++}
++
++int
++procfile_write(struct file *file, const char *buffer,
++               unsigned long count, void *data)
++{
++	char temp;
++
++	printk(KERN_ALERT "Inside write\n");
++	printk(KERN_ALERT "count: %lu\n", count);
++
++	if (count > 0) {
++		copy_from_user(&temp, buffer, 1);
++		printk(KERN_ALERT "buffer: %s\n", buffer);
++		value = temp - '0';
++		return 1;
++	} else {
++		return 0;
++	}
++}
++
++int init_module()
++{
++	/* Initialize file */
++	Our_Proc_File = create_proc_entry(procfs_name, 0644, NULL);
++	
++	if (Our_Proc_File == NULL) {
++		printk(KERN_ALERT "Error: Could not initialize /proc/%s\n",
++		       procfs_name);
++		remove_proc_entry(procfs_name, &proc_root);
++		return -ENOMEM;
++	}
++
++	Our_Proc_File->read_proc = procfile_read;
++	Our_Proc_File->write_proc = procfile_write;
++	Our_Proc_File->owner 	 = THIS_MODULE;
++	Our_Proc_File->mode 	 = S_IFREG | S_IRUGO | S_IWUSR;
++	Our_Proc_File->uid 	 = 0;
++	Our_Proc_File->gid 	 = 0;
++	Our_Proc_File->size 	 = 0;
++
++	/* Initialize file contents */
++	value = 0;
++
++	printk(KERN_INFO "/proc/%s created\n", procfs_name);	
++	return 0;
++}
++
++void cleanup_module()
++{
++	remove_proc_entry(procfs_name, &proc_root);
++	printk(KERN_INFO "/proc/%s removed\n", procfs_name);
++}
+diff -Naur linux-2.6.9/include/asm-i386/unistd.h linux-2.6.9lab2/include/asm-i386/unistd.h
+--- linux-2.6.9/include/asm-i386/unistd.h	2004-10-18 17:54:37.000000000 -0400
++++ linux-2.6.9lab2/include/asm-i386/unistd.h	2013-01-30 12:24:57.000000000 -0500
+@@ -290,8 +290,9 @@
+ #define __NR_mq_getsetattr	(__NR_mq_open+5)
+ #define __NR_sys_kexec_load	283
+ #define __NR_waitid		284
++#define __NR_sys_mycounter		285
+ 
+-#define NR_syscalls 285
++#define NR_syscalls 286
+ 
+ /* user-visible error numbers are in the range -1 - -124: see <asm-i386/errno.h> */
+ 
+diff -Naur linux-2.6.9/kernel/Makefile linux-2.6.9lab2/kernel/Makefile
+--- linux-2.6.9/kernel/Makefile	2004-10-18 17:53:43.000000000 -0400
++++ linux-2.6.9lab2/kernel/Makefile	2013-01-30 11:38:49.000000000 -0500
+@@ -7,7 +7,7 @@
+ 	    sysctl.o capability.o ptrace.o timer.o user.o \
+ 	    signal.o sys.o kmod.o workqueue.o pid.o \
+ 	    rcupdate.o intermodule.o extable.o params.o posix-timers.o \
+-	    kthread.o
++	    kthread.o mycounter.o
+ 
+ obj-$(CONFIG_FUTEX) += futex.o
+ obj-$(CONFIG_GENERIC_ISA_DMA) += dma.o
+diff -Naur linux-2.6.9/kernel/mycounter_ananth.c linux-2.6.9lab2/kernel/mycounter_ananth.c
+--- linux-2.6.9/kernel/mycounter_ananth.c	1969-12-31 19:00:00.000000000 -0500
++++ linux-2.6.9lab2/kernel/mycounter_ananth.c	2013-01-30 13:22:38.000000000 -0500
+@@ -0,0 +1,10 @@
++#include <linux/linkage.h>
++
++#define SIZE_ULONG (sizeof(unsigned long))
++
++asmlinkage long sys_mycounter(unsigned long *ct){
++	unsigned long temp;
++	copy_from_user(temp, ct, SIZE_ULONG);
++	temp++;
++	copy_to_user(ct, temp, SIZE_ULONG);	
++}
+diff -Naur linux-2.6.9/kernel/mycounter.c linux-2.6.9lab2/kernel/mycounter.c
+--- linux-2.6.9/kernel/mycounter.c	1969-12-31 19:00:00.000000000 -0500
++++ linux-2.6.9lab2/kernel/mycounter.c	2013-02-05 17:13:32.000000000 -0500
+@@ -0,0 +1,59 @@
++#include <linux/linkage.h>
++#include "../include/linux/stat.h"
++#include "../include/linux/types.h"
++#include "../include/linux/fcntl.h"
++#include "../include/linux/unistd.h"
++#include "../include/asm-generic/errno-base.h"
++#include "../include/asm-i386/uaccess.h"
++#include "../include/linux/err.h"
++
++#define SIZE_OF_ULONG (sizeof(unsigned long))
++
++asmlinkage long
++sys_mycounter(unsigned long *ct) {
++  int fd, bytes_read;
++  unsigned long temp;
++  char c;
++
++  /* Open file
++   *
++   * NOTE: set_fs() and get_fs() are used since sys_open() will not
++   * work properly unless the address space is changed. We found this
++   * information from: go.osu.edu/linuxmaglink ("Things You Should Never
++   * Do in the Linux Kernel" via Linux Journal).
++   */
++  mm_segment_t old_fs = get_fs();
++  set_fs(KERNEL_DS);
++  fd = sys_open("/proc/sys/kernel/mycounter", O_RDONLY, 0);
++
++  if (IS_ERR(&fd))
++    printk(KERN_INFO "Error from open\n");
++
++  /* Read value */
++  bytes_read = sys_read(fd, &c, 1);
++  printk(KERN_INFO "Bytes read from syscall %d\n", bytes_read);
++  printk(KERN_INFO "C: %c\n", c);
++  sys_close(fd);
++  set_fs(old_fs);
++
++  if (bytes_read != 1)
++    return -2;
++
++  /* Copy from user */
++  if (copy_from_user(&temp, ct, SIZE_OF_ULONG))
++    return -3;
++
++  /* Perform action */
++  if (c == '0')
++    temp++;
++  else if (c == '1')
++    temp *= 2;
++  else
++    return -4;
++
++  /* Copy to user */
++  if (copy_to_user(ct, &temp, SIZE_OF_ULONG))
++    return -5;
++
++  return 0;
++}
+diff -Naur linux-2.6.9/Makefile linux-2.6.9lab2/Makefile
+--- linux-2.6.9/Makefile	2004-10-18 17:54:38.000000000 -0400
++++ linux-2.6.9lab2/Makefile	2013-01-30 11:28:58.000000000 -0500
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 9
+-EXTRAVERSION =
++EXTRAVERSION = lab2
+ NAME=Zonked Quokka
+ 
+ # *DOCUMENTATION*
